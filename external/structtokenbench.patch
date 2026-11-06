@@ -1,0 +1,681 @@
+Integration of PS-JEPA into StructTokenBench.
+
+Base commit: 2681b240f6a1060291be654c743649d8bfa3985e
+Upstream:    https://github.com/KatarinaYuan/StructTokenBench (MIT License,
+             Copyright (c) 2025 Xinyu Yuan)
+
+Adds PS-JEPA tokenizer integration, representation-aware feature caching,
+validation-based head selection and metrics output for downstream evaluation.
+
+Apply with:
+    scripts/structtokenbench/apply_patch.sh /path/to/StructTokenBench
+
+---- patch begins ----
+diff --git a/src/data_module.py b/src/data_module.py
+index f13b610..81fc4ba 100644
+--- a/src/data_module.py
++++ b/src/data_module.py
+@@ -24,7 +24,7 @@ class ProteinDataModule(pl.LightningDataModule):
+ 
+     def __init__(self, tokenizer_name: str, tokenizer_device: str, seed: int, 
+         micro_batch_size: int, data_args, py_logger, test_only: bool, 
+-        precompute_tokens: bool, tokenizer_kwargs: dict,
++        precompute_tokens: bool, tokenizer_kwargs: dict, validation_only: bool = False,
+     ):
+         super().__init__()
+ 
+@@ -36,13 +36,15 @@ class ProteinDataModule(pl.LightningDataModule):
+         self.data_args = data_args
+         self.py_logger = py_logger
+         self.test_only = test_only
++        self.validation_only = validation_only
+         self.precompute_tokens = precompute_tokens
+ 
+         if self.test_only:
+             self.all_split_names = []
+         else:
+             self.all_split_names = ["validation"]
+-        self.all_split_names += eval(self.data_args.data_name).SPLIT_NAME["test"]
++        if not self.validation_only:
++            self.all_split_names += eval(self.data_args.data_name).SPLIT_NAME["test"]
+         # to store device: tokenizer map to prevent multiple tokenizers on the same device
+         self.device_tokenizer_map = {} 
+ 
+@@ -106,7 +108,12 @@ class ProteinDataModule(pl.LightningDataModule):
+         
+         if dataset.data_name not in ["ConformationalSwitchDataset", "CASP14Dataset", "CAMEODataset"]:
+             for i in tqdm(range(len(dataset.data))):
+-                assert len(dataset.data[i]["real_seqs"]) == len(dataset.data[i]["token_ids"])
++                # With lazy tokenization these fields are populated by
++                # __getitem__, not during dataset construction.  Validate
++                # cached records here without making precompute_tokens=False
++                # unusable for smoke tests.
++                if "real_seqs" in dataset.data[i] and "token_ids" in dataset.data[i]:
++                    assert len(dataset.data[i]["real_seqs"]) == len(dataset.data[i]["token_ids"])
+         return dataset
+ 
+     def train_dataloader(self):
+diff --git a/src/dataset/base.py b/src/dataset/base.py
+index 3c5de9c..09ceb11 100644
+--- a/src/dataset/base.py
++++ b/src/dataset/base.py
+@@ -341,7 +341,15 @@ class BaseDataset(Dataset):
+         pdb_id, chain_id = item["pdb_id"], item["chain_id"]
+         pdb_path = self.retrieve_pdb_path(pdb_id, chain_id)
+         
+-        if self.data_name == "AtlasDataset":
++        if isinstance(
++            self.tokenizer,
++            (WrappedOurPretrainedTokenizer, WrappedPSJEPATokenizer, WrappedPSJEPAContinuousTokenizer),
++        ):
++            # The released processed_structured_* files already contain a
++            # WrappedProteinChain with atom37 coordinates. Structure tokenizers consume
++            # that object directly, so no external mmCIF lookup is needed.
++            pass
++        elif self.data_name == "AtlasDataset":
+             chain_id = " "
+         else:
+             # convert chain_id if necessary because some chain_id needs to 
+@@ -351,6 +359,41 @@ class BaseDataset(Dataset):
+             chain_id, is_changed = convert_chain_id(pdb_path, chain_id)
+         assigned_labels = item[self.target_field]
+         assert pdb_chain is not None
++
++        tokenizer_domain_continuous = (
++            isinstance(
++                self.tokenizer,
++                (WrappedPSJEPATokenizer, WrappedPSJEPAContinuousTokenizer),
++            )
++            and self.tokenizer.representation in {
++                "global_only",
++                "global_plus_residue",
++                # 3D-JEPA patch tokens are likewise not residue-indexed.
++                "patch_tokens",
++                # 3D-JEPA residue_interp features are residue-indexed, but FPS centers must
++                # cover the SCOP domain, so the crop still happens before grouping
++                # (the adapter returns the cropped residue numbers).
++                "residue_interp",
++                "residue_group",
++                "continuous_semantic",
++                "quantized_semantic",
++                # A fixed-slot stream is not residue-indexed either: it returns L
++                # tokens for the whole chain, so the SCOP domain range has to crop
++                # the coordinates before tokenization rather than select among
++                # positions afterwards. Without this the range is intersected with
++                # synthetic slot indices and comes back empty, which the assert
++                # below reports as a broken sample.
++                "slot_ids",
++                "slot_embeddings",
++            }
++        )
++        domain_selected_indices = None
++        if tokenizer_domain_continuous:
++            # Remote-homology entries may be SCOP domains rather than a whole
++            # chain. Crop before APT computes global and residue embeddings.
++            domain_selected_indices = self._get_selected_indices(
++                np.asarray(pdb_chain.residue_index), residue_range
++            )
+         
+         if self.is_global_or_local == "local":
+             assert len(residue_range) == 1 and residue_range[0] == ""
+@@ -383,6 +426,16 @@ class BaseDataset(Dataset):
+             token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_path, chain_id, self.use_sequence)
+         elif isinstance(self.tokenizer, WrappedOurPretrainedTokenizer):
+             token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_chain, self.use_continuous, self.use_sequence) # torch.Tensors
++        elif isinstance(
++            self.tokenizer,
++            (WrappedPSJEPATokenizer, WrappedPSJEPAContinuousTokenizer),
++        ):
++            token_ids, residue_index, seqs = self.tokenizer.encode_structure(
++                pdb_chain,
++                self.use_continuous,
++                self.use_sequence,
++                selected_indices=domain_selected_indices,
++            )
+         elif isinstance(self.tokenizer, WrappedAIDOTokenizer):
+             token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_path, chain_id, self.use_continuous, self.use_sequence)
+         elif isinstance(self.tokenizer, WrappedCheapS1D64Tokenizer):
+@@ -437,7 +490,13 @@ class BaseDataset(Dataset):
+                 print(">> residue reduced by : ", org_len - len(token_ids))
+ 
+         # select according to residue range constraints for some global tasks
+-        selected_indices = self._get_selected_indices(residue_index, residue_range)
++        if tokenizer_domain_continuous:
++            # The domain crop was already applied before tokenization. Keep the
++            # returned global/residue positions instead of interpreting their
++            # synthetic indices as PDB residue numbers.
++            selected_indices = np.arange(len(token_ids))
++        else:
++            selected_indices = self._get_selected_indices(residue_index, residue_range)
+         assert len(selected_indices) != 0
+         
+         token_ids = token_ids[selected_indices]
+@@ -547,7 +606,14 @@ class BaseDataset(Dataset):
+         if flag:
+             index = np.nonzero(flag_list)[0].item()
+             tokenizer_name = name_list[index]
+-            if isinstance(self.tokenizer, WrappedOurPretrainedTokenizer):
++            if isinstance(
++                self.tokenizer,
++                (
++                    WrappedOurPretrainedTokenizer,
++                    WrappedPSJEPATokenizer,
++                    WrappedPSJEPAContinuousTokenizer,
++                ),
++            ):
+                 tokenizer_name += f"_{self.tokenizer.ckpt_name}"
+ 
+             # use continous reprs
+@@ -591,6 +657,12 @@ class BaseDataset(Dataset):
+                 raise IndexError
+         if flag:
+             torch.save(self.data, cache_file_name)
++            # TAPE remote-homology keeps the unfiltered 1,195-label data in
++            # the tokenizer cache so every tokenizer can reuse the same
++            # filtering procedure.  Apply the 45-class benchmark filter to
++            # this first in-memory run as well; previously it was only
++            # applied when reloading an existing cache.
++            self.additional_label_filtering_for_TAPE_homo(tokenizer_name)
+ 
+     def shard(self, shard_idx: int, num_shards: int):
+         """Shard the dataset inplace by keeping the every `num_shards`"""
+@@ -681,4 +753,3 @@ class BaseDataset(Dataset):
+     
+ 
+     
+-
+diff --git a/src/dataset/biolip2.py b/src/dataset/biolip2.py
+index aa865b2..a8d2e8f 100644
+--- a/src/dataset/biolip2.py
++++ b/src/dataset/biolip2.py
+@@ -29,8 +29,13 @@ class BioLIP2FunctionDataset(BaseDataset):
+     }
+ 
+     ALL_DATA_FILE = "biolip2/biolip2_filtered_all"
++    # Additional named test splits, e.g. the post-2025 temporal BioLIP2 sets built by
++    # PS-JEPA/scripts/build_temporal_biolip2.py. Env-gated so the standard fold /
++    # superfamily runs are byte-identical to before. Each extra split needs a raw record
++    # file `biolip2/{target_field}_{split}` in the same format as the standard splits.
++    EXTRA_TEST_SPLITS = [s for s in os.environ.get("STB_EXTRA_TEST_SPLITS", "").split(",") if s]
+     SPLIT_NAME = {
+-        "test": ["fold_test", "superfamily_test"]
++        "test": ["fold_test", "superfamily_test"] + EXTRA_TEST_SPLITS
+     }
+     SAVE_SPLIT = ["train", "validation", "fold_test", "superfamily_test"]
+     
+@@ -78,6 +83,16 @@ class BioLIP2FunctionDataset(BaseDataset):
+         
+         assert dist.get_world_size() == 1, "dataset not preprocessed and splitted, please not to use multi-GPU training"
+ 
++        if self.split in self.EXTRA_TEST_SPLITS:
++            # An extra split is a finished record list, not a re-split of the CATH-labelled
++            # pool: load it, drop rows without the target label, and let the base class
++            # parse structures from `pdb_data_dir` and apply its length filter as usual.
++            raw_split_file = os.path.join(self.data_path, f"biolip2/{self.target_field}_{self.split}")
++            self.data = torch.load(raw_split_file, weights_only=False)
++            self.py_logger.info(f"Loaded extra test split {self.split}: {len(self.data)} raw entries")
++            self.filter_missing_labels()
++            return
++
+         all_data_file = os.path.join(self.data_path, self.ALL_DATA_FILE)
+         if not os.path.exists(all_data_file):
+             self.extract_useful_features()
+diff --git a/src/dataset/conformational_switch.py b/src/dataset/conformational_switch.py
+index 0d9af4a..11ed396 100644
+--- a/src/dataset/conformational_switch.py
++++ b/src/dataset/conformational_switch.py
+@@ -197,6 +197,14 @@ class ConformationalSwitchDataset(BaseDataset):
+             elif isinstance(self.tokenizer, WrappedOurPretrainedTokenizer):
+                 token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_chain, self.use_continuous, self.use_sequence) # torch.Tensors
+                 assert len(token_ids) == len(residue_index)
++            elif isinstance(
++                self.tokenizer,
++                (WrappedPSJEPATokenizer, WrappedPSJEPAContinuousTokenizer),
++            ):
++                # Same call as dataset/base.py: these adapters consume the
++                # WrappedProteinChain stored in the released processed file.
++                token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_chain, self.use_continuous, self.use_sequence)
++                assert len(token_ids) == len(residue_index)
+             else:
+                 raise NotImplementedError
+             # select according to residue range constraints
+diff --git a/src/model_module.py b/src/model_module.py
+index c7a66dd..8cf5852 100644
+--- a/src/model_module.py
++++ b/src/model_module.py
+@@ -17,7 +17,10 @@ from transformers.trainer_pt_utils import get_parameter_names
+ from transformers import AutoConfig, AdamW, EsmModel
+ from torch.optim import Adam
+ import torch.nn.functional as F
+-import deepspeed
++try:
++    import deepspeed
++except ModuleNotFoundError:
++    deepspeed = None
+ from pytorch_lightning.utilities import grad_norm
+ 
+ 
+@@ -182,7 +185,10 @@ class SequenceClassificationModel(ProceedingBaseModel):
+ 
+         # averge pool for the last hidden state to get seq-level reprs.
+         num_of_tokens = (~input_mask).sum(dim=1, keepdim=True)  # (B, 1) or (B, 1, dim)
+-        if len(input_ids.shape) == 3:
++        # Branch on input_mask, not input_ids: num_of_tokens is derived from the
++        # mask, and a genuinely continuous tokenizer pairs 3D features with a 2D
++        # mask (see BaseDataset.collate_fn), which the input_ids test mis-handles.
++        if len(input_mask.shape) == 3:
+             assert (num_of_tokens[:, :, :-1] == num_of_tokens[:, :,  :-1]).all()
+             num_of_tokens = num_of_tokens[:, :, 0] # (B, 1)
+ 
+@@ -328,7 +334,10 @@ class ZeroshotProximityModel(ProceedingBaseModel):
+             embed = F.normalize(embed, p=2, dim=-1)
+             embed = embed.to(torch.float16)
+             sim_score = torch.matmul(embed, embed.T)
+-            sim_score = sim_score.numpy() * 100
++            # biotite >= 1.0 accepts only integer score matrices; the truncating
++            # cast reproduces what np.asarray(..., dtype=int32) did in the older
++            # release this code was written against (scores are cosine x 100).
++            sim_score = (sim_score.float().numpy() * 100).astype(np.int32)
+             real_num_tokens = sim_score.shape[0]
+             self.real_num_tokens = real_num_tokens
+             self.alphabet = Alphabet(list(range(real_num_tokens)))
+@@ -359,13 +368,20 @@ class ZeroshotProximityModel(ProceedingBaseModel):
+                 score_list.append(align_score)
+             else:
+                 # lst1: [L1, hidden_dim], lst2: [L2, hidden_dim]
++                # Drop padding rows first. collate_fn pads every channel with the
++                # tokenizer's pad id, so a pad row is constant across channels and a
++                # real embedding never is. The released code aligned pad rows as if
++                # they were residues (score 0 beats a -10 gap), which made the score
++                # depend on the batch composition.
++                lst1 = lst1[~(lst1 == lst1[:, :1]).all(-1)]
++                lst2 = lst2[~(lst2 == lst2[:, :1]).all(-1)]
+                 lst1_embed = F.normalize(lst1, p=2, dim=-1)
+                 lst2_embed = F.normalize(lst2, p=2, dim=-1)
+                 sim = torch.matmul(lst1_embed, lst2_embed.T) # [L1, L2]
+                 sim = sim.detach().cpu().numpy() * 100
+                 L1, L2 = len(lst1_embed), len(lst2_embed)
+-                sim_score = np.zeros((L1 + L2, L1 + L2))
+-                sim_score[:L1, L1:] = sim
++                sim_score = np.zeros((L1 + L2, L1 + L2), dtype=np.int32)
++                sim_score[:L1, L1:] = sim.astype(np.int32)  # see the codebook branch above
+ 
+                 alphabet = Alphabet(list(range(L1 + L2)))
+                 substitution_matrix = SubstitutionMatrix(alphabet, alphabet, sim_score)
+@@ -375,7 +391,13 @@ class ZeroshotProximityModel(ProceedingBaseModel):
+                 score_list.append(align_score)
+ 
+         score_list = torch.tensor(score_list, device=targets.device)
+-        metrics = calculate_regression_metric(score_list.float(), targets)
++        # Per-batch correlations are placeholders: the epoch end recomputes
++        # spearman / pearson over all pairs. R2Score needs >= 2 samples, so a
++        # trailing batch of one would otherwise crash the run.
++        if bsz >= 2:
++            metrics = calculate_regression_metric(score_list.float(), targets)
++        else:
++            metrics = {}
+         
+         loss_and_metrics = (torch.zeros(1, device=targets.device), {k:v for k,v in metrics.items() if k != "r2"})
+ 
+@@ -417,7 +439,8 @@ class PlModel(pl.LightningModule):
+                     behavior only used for inheritance
+         """
+ 
+-        self.trainer.strategy.config["train_micro_batch_size_per_gpu"] = self.optimizer_cfg.micro_batch_size
++        if hasattr(self.trainer.strategy, "config"):
++            self.trainer.strategy.config["train_micro_batch_size_per_gpu"] = self.optimizer_cfg.micro_batch_size
+         self.model = model_init_fn(self.trainer, self.model_cfg, 
+                         codebook_embedding=self.codebook_embedding)
+         
+@@ -607,11 +630,14 @@ class PlModel(pl.LightningModule):
+             getattr(self, f"{split}_step_outputs").clear()
+ 
+     def on_before_optimizer_step(self, optimizer):
+-        for n,p in self.model.named_parameters():
+-            grad_data = deepspeed.utils.safe_get_full_grad(p)
+-            p.grad = grad_data
++        if deepspeed is not None and hasattr(self.trainer.strategy, "config"):
++            for _, p in self.model.named_parameters():
++                p.grad = deepspeed.utils.safe_get_full_grad(p)
+         norms = grad_norm(self.model, norm_type=2)
+-        norms = {k:v.to(grad_data.device) for k,v in norms.items()}
++        # Lightning's grad_norm utility may return CPU scalar tensors. NCCL
++        # cannot reduce CPU tensors even for a one-rank DDP job, so place all
++        # logged norms on the module device before sync_dist.
++        norms = {name: value.to(self.device) for name, value in norms.items()}
+         
+         self.log_dict(
+             norms,
+diff --git a/src/modeling_util.py b/src/modeling_util.py
+index aea860b..325cc62 100644
+--- a/src/modeling_util.py
++++ b/src/modeling_util.py
+@@ -1,5 +1,10 @@
+ import torch
+-import deepspeed
++from contextlib import nullcontext
++
++try:
++    import deepspeed
++except ModuleNotFoundError:
++    deepspeed = None
+ 
+ from util import get_dtype
+ 
+@@ -11,23 +16,26 @@ def model_init_fn(trainer, model_cfg, **model_kwargs):
+ 
+     init_dtype = get_dtype(trainer.precision)
+ 
+-    is_zero3 = trainer.strategy.config["zero_optimization"]["stage"] == 3
+-    context = deepspeed.zero.Init(
+-        remote_device=trainer.strategy.remote_device,
+-        pin_memory=True,
+-        config_dict_or_path=trainer.strategy.config,
+-        dtype=init_dtype,
+-        enabled=is_zero3,
+-    )
+-    
+-    from model_module import SequenceClassificationModel, ZeroshotProximityModel, ZeroShotCodebookUtilityModel
+-    from vqvae_model import VQVAEModel
++    strategy_config = getattr(trainer.strategy, "config", None)
++    if deepspeed is not None and strategy_config is not None:
++        is_zero3 = strategy_config["zero_optimization"]["stage"] == 3
++        context = deepspeed.zero.Init(
++            remote_device=trainer.strategy.remote_device,
++            pin_memory=True,
++            config_dict_or_path=strategy_config,
++            dtype=init_dtype,
++            enabled=is_zero3,
++        )
++    else:
++        context = nullcontext()
++
++    import model_module
++    model_cls = getattr(model_module, model_cfg.class_name)
+ 
+     with context:
+-        model = eval(model_cfg.class_name)(
++        model = model_cls(
+             model_cfg,
+             **model_kwargs
+         )
+ 
+     return model
+-
+diff --git a/src/script/run_supervised_task.py b/src/script/run_supervised_task.py
+index 48224e0..0dd825a 100644
+--- a/src/script/run_supervised_task.py
++++ b/src/script/run_supervised_task.py
+@@ -1,5 +1,6 @@
+ import os
+ import sys
++import json
+ from glob import glob
+ import hydra
+ import omegaconf
+@@ -88,6 +89,13 @@ def main(cfg):
+             "pretrained_ckpt_path": cfg.tokenizer_pretrained_ckpt_path,
+             "ckpt_name": cfg.tokenizer_ckpt_name,
+         }
++    elif cfg.tokenizer in {"WrappedPSJEPATokenizer", "WrappedPSJEPAContinuousTokenizer"}:
++        pretrained_model_cfg = {
++            "psjepa_root": cfg.psjepa_root,
++            "checkpoint_path": cfg.psjepa_checkpoint_path,
++            "ckpt_name": cfg.tokenizer_ckpt_name,
++            "representation": getattr(cfg, "psjepa_representation", "discrete_ids"),
++        }
+     else:
+         pretrained_model_cfg = {}
+ 
+@@ -99,6 +107,7 @@ def main(cfg):
+         data_args=cfg.data,
+         py_logger=logger,
+         test_only=getattr(cfg, "test_only", False),
++        validation_only=getattr(cfg, "validation_only", False),
+         precompute_tokens=getattr(cfg, "precompute_tokens", False),
+         tokenizer_kwargs=pretrained_model_cfg
+     )
+@@ -123,6 +132,10 @@ def main(cfg):
+ 
+     # training pipeline
+     
++    post_selection_test = getattr(cfg, "post_selection_test", False)
++    if post_selection_test and not getattr(cfg, "validation_only", False):
++        raise ValueError("post_selection_test requires validation_only=true during head training")
++
+     if not getattr(cfg, "validate_only", False) and not getattr(cfg, "test_only", False):
+         logger.info("*********** start training ***********\n\n")
+         
+@@ -138,16 +151,51 @@ def main(cfg):
+         if torch.distributed.is_initialized():
+             torch.distributed.barrier()
+         
+-        trainer.validate(
++        validation_results = trainer.validate(
+             model=model, datamodule=datamodule,
+             ckpt_path="best",
+         )
+     else:
+         logger.info("*********** start validation ***********\n\n")
+-        trainer.validate(
++        validation_results = trainer.validate(
+             model=model, datamodule=datamodule,
+             ckpt_path=cfg.model.ckpt_path
+         )
+ 
++    # Test loaders are deliberately absent while fitting and selecting the
++    # supervised head.  Once the PS-JEPA configuration and seed are locked,
++    # evaluate every named test split exactly once with that validation-selected
++    # head.  This keeps screening strictly validation-only.
++    test_results = None
++    test_split_names = []
++    if post_selection_test:
++        dataset_class = getattr(data_module, cfg.data.data_name)
++        test_split_names = list(dataset_class.SPLIT_NAME["test"])
++        datamodule.all_split_names = test_split_names
++        model.all_split_names = test_split_names
++        for split in test_split_names:
++            setattr(model, f"{split}_step_outputs", [])
++        test_results = trainer.validate(
++            model=model, datamodule=datamodule,
++            ckpt_path="best",
++        )
++
++    metrics_output_path = getattr(cfg, "metrics_output_path", None)
++    if metrics_output_path and trainer.is_global_zero:
++        output_dir = os.path.dirname(metrics_output_path)
++        if output_dir:
++            os.makedirs(output_dir, exist_ok=True)
++        if test_results is None:
++            payload = validation_results[0] if len(validation_results) == 1 else validation_results
++        else:
++            payload = {
++                "selection_split": "validation",
++                "test_data_used_for_selection": False,
++                "validation": validation_results[0],
++                "test": dict(zip(test_split_names, test_results)),
++            }
++        with open(metrics_output_path, "w") as handle:
++            json.dump(payload, handle, indent=2, sort_keys=True)
++
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/src/tokenizer.py b/src/tokenizer.py
+index 58ec0c4..e58be22 100644
+--- a/src/tokenizer.py
++++ b/src/tokenizer.py
+@@ -1,4 +1,5 @@
+ import os
++import sys
+ import time
+ import joblib
+ import pickle
+@@ -77,9 +78,6 @@ except ModuleNotFoundError:
+     print("[Warining]: ProteinMPNN not found")
+ 
+ 
+-from vqvae_model import VQVAEModel
+-
+-
+ SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
+ 
+ # Reside Name Mapping:
+@@ -98,15 +96,89 @@ ALL_TOKENIZER_TYPE = {
+         "WrappedProTokensTokenizer",
+         "WrappedOurPretrainedTokenizer",
+         "WrappedAIDOTokenizer",
++        "WrappedPSJEPATokenizer",
+     ],
+     "continuous": [
+         "WrappedMIFTokenizer",
+         "WrappedProteinMPNNTokenizer",
+-        "WrappedCheapS1D64Tokenizer"
++        "WrappedCheapS1D64Tokenizer",
++        # 3D-JEPA has no codebook: its encoder only ever emits continuous
++        # patch-token features.
++        # Point-JEPA port: continuous group tokens read out per residue.
++        "WrappedPSJEPAContinuousTokenizer",
+     ]
+ }
+ 
+ 
++class WrappedPSJEPATokenizer:
++    """Load PS-JEPA residue FSQ IDs through its project-owned adapter."""
++
++    def __init__(
++        self,
++        device: torch.device | str = "cpu",
++        psjepa_root: str | None = None,
++        checkpoint_path: str | None = None,
++        ckpt_name: str | None = None,
++        representation: str = "discrete_ids",
++    ):
++        if not psjepa_root or not checkpoint_path:
++            raise ValueError("psjepa_root and checkpoint_path are required")
++        psjepa_src = os.path.join(os.path.abspath(psjepa_root), "src")
++        if psjepa_src not in sys.path:
++            sys.path.insert(0, psjepa_src)
++        from psjepa.tokenization.structtokenbench_adapter import (
++            WrappedPSJEPATokenizer as PSJEPAAdapter,
++        )
++
++        self._adapter = PSJEPAAdapter(
++            device=device,
++            checkpoint_path=checkpoint_path,
++            ckpt_name=ckpt_name,
++            representation=representation,
++        )
++        self.representation = representation
++        self.ckpt_name = self._adapter.ckpt_name
++        self.pad_token_id = self._adapter.pad_token_id
++
++    def get_num_tokens(self):
++        return self._adapter.get_num_tokens()
++
++    def get_codebook_embedding(self):
++        return self._adapter.get_codebook_embedding()
++
++    def encode_structure(self, *args, **kwargs):
++        return self._adapter.encode_structure(*args, **kwargs)
++
++
++class WrappedPSJEPAContinuousTokenizer:
++    """Distinct registry type for continuous PS-JEPA semantic features."""
++
++    def __init__(self, *args, representation: str = "continuous_semantic", **kwargs):
++        if representation not in {"continuous_semantic", "quantized_semantic"}:
++            raise ValueError(f"Unsupported continuous PS-JEPA representation: {representation}")
++        self._wrapped = WrappedPSJEPATokenizer(*args, representation=representation, **kwargs)
++        self.representation = representation
++        self.ckpt_name = self._wrapped.ckpt_name
++        self.pad_token_id = self._wrapped.pad_token_id
++
++    def get_num_tokens(self):
++        return None
++
++    def get_codebook_embedding(self):
++        return None
++
++    def encode_structure(self, *args, **kwargs):
++        return self._wrapped.encode_structure(*args, **kwargs)
++
++
++
++
++
++
++
++
++
++
+ class WrappedFoldSeekTokenizer():
+ 
+     FOLDSEEK_STRUC_VOCAB = "ACDEFGHIKLMNPQRSTVWYX"
+@@ -323,6 +395,10 @@ class WrappedCheapS1D64Tokenizer(WrappedCheapBaseTokenizer):
+ class WrappedOurPretrainedTokenizer():
+ 
+     def __init__(self, device: torch.device | str = "cpu", model_cfg=None, pretrained_ckpt_path=None, ckpt_name=None):
++        # VQVAEModel imports DeepSpeed, which is unnecessary for every other
++        # tokenizer; keep that optional dependency lazy.
++        from vqvae_model import VQVAEModel
++
+         self.device = device
+         # load
+         self.model = VQVAEModel(model_cfg=model_cfg)
+@@ -557,4 +633,4 @@ class WrappedProteinMPNNTokenizer():
+ 
+         assert len(pdb_dict_list[0]["seq"]) == len(h_V[0])
+         seqs = [Bio.PDB.Polypeptide.one_to_index(x) if x != "X" else 20 for x in pdb_dict_list[0]["seq"]] # total 20 standard AA in Bio
+-        return h_V.squeeze(0), pdb_dict_list[0]["ridx"], seqs # [L, 128], [L]
+\ No newline at end of file
++        return h_V.squeeze(0), pdb_dict_list[0]["ridx"], seqs # [L, 128], [L]
+diff --git a/src/util.py b/src/util.py
+index e17e000..d93d819 100644
+--- a/src/util.py
++++ b/src/util.py
+@@ -18,9 +18,6 @@ from transformers.trainer_pt_utils import get_parameter_names
+ from transformers import AutoConfig, AdamW, EsmModel
+ from torch.optim import Adam
+ import torch.nn.functional as F
+-import deepspeed
+-
+-
+ from sklearn.metrics import f1_score
+ from torchmetrics.regression import R2Score, PearsonCorrCoef, SpearmanCorrCoef
+ from torchmetrics.classification import BinaryAccuracy, AUROC, BinaryF1Score, BinaryMatthewsCorrCoef, ConfusionMatrix
+diff --git a/src/vqvae_model.py b/src/vqvae_model.py
+index e18f668..5d6d074 100644
+--- a/src/vqvae_model.py
++++ b/src/vqvae_model.py
+@@ -15,7 +15,13 @@ from transformers.trainer_pt_utils import get_parameter_names
+ from transformers import AutoConfig, AdamW, EsmModel
+ from torch.optim import Adam
+ import torch.nn.functional as F
+-import deepspeed
++try:
++    import deepspeed
++except ModuleNotFoundError:
++    # Tokenizer-only inference does not use DeepSpeed.  Keep it optional so
++    # released VQ-VAE checkpoints can be evaluated in the same lightweight
++    # environment as the other StructTokenBench tokenizers.
++    deepspeed = None
+ from pytorch_lightning.utilities import grad_norm
+ 
+ 
+@@ -907,7 +913,13 @@ class LightningVQPretrainModel(pl.LightningModule):
+ 
+     def on_before_optimizer_step(self, optimizer):
+         for n,p in self.model.named_parameters():
+-            grad_data = deepspeed.utils.safe_get_full_grad(p)
++            grad_data = (
++                deepspeed.utils.safe_get_full_grad(p)
++                if deepspeed is not None
++                else p.grad
++            )
++            if grad_data is None:
++                continue
+             p.grad = grad_data
+         norms = grad_norm(self.model, norm_type=2)
+         norms = {k:v.to(grad_data.device) for k,v in norms.items()}

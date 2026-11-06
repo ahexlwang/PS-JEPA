@@ -1,0 +1,59 @@
+data:
+  cache: afdb
+  num_workers: 8
+  train_limit: null
+  validation_limit: null
+experiment: psjepa_d512
+loss:
+  normalize_prediction: false
+  s2s: 1.0
+masking:
+  context_ratio: 0.85
+  exclude_context: true
+  spatial_probability: 0.5
+  target_blocks: 4
+  target_ratio: 0.125
+model:
+  d_model: 512
+  gvp_edge_positional: true
+  gvp_global_radial: 16
+  gvp_layers: 3
+  gvp_message_layers: 2
+  gvp_neighbours: 12
+  gvp_node_vectors: 16
+  input_mode: gvp_message
+  max_residues: 512
+  mixer_backend: mamba
+  n_layer: 8
+  predictor_layers: 2
+  quantize: false
+  use_residue_identity: false
+  encoder_layout: residue_only
+  padding_invariant: true
+  gvp_node_features: paper
+model_family: psjepa
+output_dir: encoder/psjepa_d512
+seed: 42
+training:
+  accumulation_steps: 8
+  batch_size: 64
+  ema_horizon: 12500
+  ema_max: 0.9999
+  ema_window_fraction: 0.0125
+  grad_clip: 1.0
+  learning_rate: 0.00085
+  log_every: 31
+  max_steps: 35000
+  plateau:
+    lr_factor: 0.3
+    lr_reductions: 2
+    min_delta: 0.005
+    min_steps: 12500
+    patience: 999
+    window: 3
+  precision: bf16
+  schedule: plateau
+  validate_every: 312
+  validation_batches: 50
+  warmup_steps: 625
+  weight_decay: 0.05

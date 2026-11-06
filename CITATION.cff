@@ -1,0 +1,24 @@
+cff-version: 1.2.3
+title: PS-JEPA
+message: >-
+  Please cite PS-JEPA when using this software or its released encoder.
+type: software
+abstract: >-
+  Sequence-free protein structure representation from backbone geometry. A GVP
+  message-passing featuriser and a bidirectional Mamba mixer trained as a joint-embedding
+  predictive architecture with frozen teacher evaluation.
+authors:
+  - family-names: Hwang
+    given-names: Untaek
+    affiliation: Seoul National University
+  - family-names: Lee
+    given-names: Juyong
+    affiliation: Seoul National University
+license: MIT
+version: 1.2.3
+date-released: "2026-11-06"
+keywords:
+  - protein structure
+  - representation learning
+  - joint-embedding predictive architecture
+  - flow matching

@@ -1,0 +1,27 @@
+PS-JEPA
+Copyright (c) 2026 the PS-JEPA authors
+
+PS-JEPA source and released encoder weights are licensed under the MIT License.
+Third-party source retains its original copyright notices and license terms.
+
+Mamba
+https://github.com/state-spaces/mamba
+Copyright (c) 2023, Tri Dao, Albert Gu.
+License: Apache-2.0; full text in LICENSES/Apache-2.0.txt.
+
+The Mamba backend is provided by the separately installed mamba-ssm package.
+The package is not bundled with PS-JEPA. Its license is supplied for reference.
+
+StructTokenBench
+https://github.com/KatarinaYuan/StructTokenBench
+Revision: 2681b240f6a1060291be654c743649d8bfa3985e
+Copyright (c) 2025 Xinyu Yuan
+License: MIT; full text in LICENSES/StructTokenBench-MIT.txt.
+
+external/structtokenbench.patch includes upstream context and PS-JEPA integration
+changes. Its header records the base revision and upstream attribution.
+
+External programs and datasets
+ProteinMPNN, ESMFold/fair-esm, foldseek, StructTokenBench and tmtools are installed
+separately under their own terms. AFDB, CATH and benchmark data are not bundled
+or relicensed by this repository.

@@ -1,0 +1,64 @@
+[project]
+name = "ps-jepa"
+version = "1.2.3"
+description = "Sequence-free protein structure representation: a GVP message-passing featuriser and a bidirectional Mamba mixer trained as a joint-embedding predictive architecture"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { file = "LICENSE" }
+keywords = ["protein structure", "representation learning", "JEPA", "flow matching", "Mamba"]
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+# Verified on Python 3.11.9, CUDA 12.8, PyTorch 2.9.1+cu128, driver 570.x.
+# `mamba-ssm` builds CUDA kernels, so a CUDA toolchain has to be present to install it and a
+# GPU to run it; see README.md for the CPU-only install that runs the test suite.
+dependencies = [
+  "torch==2.9.1",
+  "numpy>=1.26.4,<2.0",
+  "scipy>=1.13.0",
+  "pyyaml>=6.0",
+  "pyarrow==23.0.1",
+  "huggingface-hub>=0.27,<2",
+]
+
+[project.optional-dependencies]
+# The Mamba mixer. Every released checkpoint was trained with `mixer_backend: mamba`; the
+# GRU backend exists for CPU unit tests and is not weight-compatible with it.
+cuda = [
+  "mamba-ssm==2.3.2.post1",
+]
+# StructTokenBench's tokenizer adapter reads mmCIF through biopython.
+benchmark = [
+  "biopython>=1.83",
+]
+# Designability and MotifBench: ProteinMPNN sequences refolded by ESMFold, scored by TM-score.
+# ProteinMPNN and foldseek are external programs, not Python packages; see docs/EVALUATION.md.
+designability = [
+  "fair-esm[esmfold]==2.0.0",
+  "transformers>=4.40",
+  "tmtools>=0.3.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3.4"]
+
+[project.urls]
+Documentation = "https://github.com/ahexlwang/PS-JEPA/blob/main/README.md"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/psjepa", "src/biojepa"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "scripts"]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"LICENSES" = "psjepa/_licenses"
+"weights/LICENSE" = "psjepa/_licenses/Weights-MIT.txt"

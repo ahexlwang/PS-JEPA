@@ -1,0 +1,42 @@
+seed: 42
+experiment: psjepa_prior_sota_d512
+output_dir: prior/sota_d512
+
+upstream_checkpoint: encoder/psjepa_d512.pt
+decoder_checkpoint: decoder/sota_d512.pt
+max_residues: 512
+
+data:
+  cache: cath_backbone_split
+  train_limit: null
+  validation_limit: null
+  num_workers: 4
+
+model:
+  d_token: 512
+  width: 768
+  layers: 12
+  heads: 12
+  mlp_ratio: 4.0
+  dropout: 0.0
+
+training:
+  max_steps: 50000
+  batch_size: 64
+  learning_rate: 0.0008
+  weight_decay: 0.01
+  warmup_steps: 2500
+  grad_clip: 1.0
+  precision: bf16
+  time_sampling: uniform
+  statistics_batches: 200
+  log_every: 100
+  validate_every: 2500
+  checkpoint_every: 2500
+
+evaluation:
+  validation_batches: 13
+  sample_count: 16
+  token_steps: 100
+  decoder_steps: 32
+  decode_every: 2

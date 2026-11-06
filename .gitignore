@@ -1,0 +1,56 @@
+# Paths are anchored with a leading slash so they match only at the repository root.
+# An unanchored data pattern would also match package source directories.
+
+# Trained weights. Large, and distributed separately: see README.md.
+/weights/*
+!/weights/MANIFEST.tsv
+!/weights/LICENSE
+*.pt
+*.ckpt
+*.safetensors
+
+# Preprocessed datasets and anything derived from them.
+/cache/
+/data/
+
+# Run outputs: checkpoints, metrics, samples, PDB files, benchmark results.
+/outputs/
+/runs/
+
+# Runtime logs
+/logs/
+
+# External programs the evaluations shell out to are cloned into external/ and are not
+# tracked; the patch this repository ships for the benchmark is.
+/external/*
+!/external/*.patch
+
+# Machine-local settings.
+/.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+/env/
+
+# Secrets. Nothing in this repository should need one; this is a backstop.
+*.pem
+*.key
+.netrc
+secrets.*
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+*.swp

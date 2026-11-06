@@ -1,0 +1,84 @@
+# CPU checks use small GRU-backed models.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install (CPU-only torch, no mamba-ssm)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -e . --group dev
+
+      - name: Package imports without the scripts directory on the path
+        run: python -c "import psjepa, psjepa.models, psjepa.paths, psjepa.sota"
+
+      - name: Entry points import
+        run: |
+          for module in train_encoder train_decoder train_prior sample \
+                        evaluate_decoder evaluate_decoder_arms reconstruct_pdb \
+                        checkpoint_width build_cache; do
+            PYTHONPATH=src:scripts python -c "import $module" || exit 1
+          done
+
+      - name: Tests
+        run: pytest -q
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell entry points parse
+        run: bash -n scripts/env.sh scripts/structtokenbench/*.sh
+
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: error
+          scandir: "."
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No absolute home path in a tracked file
+        run: |
+          if git grep -nIE '/(home|Users)/[a-z][a-z0-9_-]+/' -- \
+               ':!docs/*' ':!*.md' ; then
+            echo "::error::a tracked file names an absolute home directory; use psjepa.paths or scripts/env.sh"
+            exit 1
+          fi
+
+      - name: No weights or data committed
+        run: |
+          if git ls-files | grep -E '\.(pt|ckpt|safetensors|npy|parquet)$'; then
+            echo "::error::weights or data are committed; they are distributed separately"
+            exit 1
+          fi
+
+      - name: No credential-shaped file committed
+        run: |
+          if git ls-files | grep -E '(^|/)(\.env|\.env\.local|\.netrc|.*\.pem|.*\.key|secrets\..*)$'; then
+            echo "::error::a credential-shaped file is tracked"
+            exit 1
+          fi

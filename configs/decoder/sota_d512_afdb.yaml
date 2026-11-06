@@ -1,0 +1,43 @@
+seed: 42
+experiment: psjepa_decoder_sota_d512_afdb
+output_dir: decoder/sota_d512_afdb
+
+upstream_checkpoint: encoder/psjepa_d512.pt
+representation: continuous_semantic
+max_residues: 512
+
+data:
+  cache: afdb
+  train_split: train
+  validation_split: validation
+  train_limit: null
+  validation_limit: null
+  num_workers: 6
+
+decoder:
+  kind: frame
+  layers: 20
+  width: 1024
+  heads: 16
+  coordinate_scale: 10.0
+
+predict_x1: true
+align_target: true
+fape_weight: 1.0
+
+training:
+  max_steps: 60000
+  batch_size: 32
+  learning_rate: 0.0004
+  weight_decay: 0.01
+  warmup_steps: 3000
+  grad_clip: 1.0
+  precision: bf16
+  log_every: 31
+  validate_every: 3000
+  checkpoint_every: 3000
+
+evaluation:
+  validation_batches: 20
+  sample_count: 16
+  sample_steps: 32
