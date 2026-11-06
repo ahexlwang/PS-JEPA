@@ -55,6 +55,8 @@ python scripts/train_encoder.py --config configs/encoder/sota_d512.yaml --resume
 entry points. [Evaluation](docs/EVALUATION.md) covers frozen-feature benchmarking
 and generated-backbone scoring. Downloadable weights currently include the encoder.
 
+![PS-JEPA frozen-encoder performance on StructTokenBench: functional AUROC 80.99, flexibility Spearman correlation 56.29, and homology macro-F1 73.03, all scaled by 100.](docs/figures/benchmark.png)
+
 | Encoder | Functional | Flexibility | Homology | Overall |
 |---|---:|---:|---:|---:|
 | PS-JEPA | 80.99 | 56.29 | 73.03 | 70.10 |
